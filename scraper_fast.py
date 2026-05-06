@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Suspicious Antwerp Scraper - Fast version with smart batch processing"""
+"""Suspicious Antwerp Scraper - Smart batch processing with stale detection"""
 
 import os
 import re
 import json
 import time
 import logging
-from datetime import datetime
-from typing import Optional, Set
+from datetime import datetime, timedelta
+from typing import Optional, Set, Dict, List
 from urllib.parse import urljoin
 
 import requests
@@ -37,9 +37,10 @@ SESSION.headers.update({
     "Accept-Language": "en-US,en;q=0.9",
 })
 
-BATCH_SIZE = 30
-EMBED_DELAY = 0.2
+BATCH_SIZE = 50
+EMBED_DELAY = 0.5
 MAX_RETRIES = 3
+CONSECUTIVE_STALE_THRESHOLD = 2
 
 logging.basicConfig(filename="scraper.log", level=logging.INFO)
 
@@ -179,9 +180,7 @@ def extract(url: str) -> Optional[dict]:
     
     main_image = image_urls[0] if image_urls else None
     
-    # Skip products without image
     if not main_image:
-        print(f"  Skipping product without image: {url}")
         return None
     
     additional_images = ", ".join(image_urls[1:7]) if len(image_urls) > 1 else ""
@@ -237,10 +236,14 @@ def extract(url: str) -> Optional[dict]:
     }
 
 
-def get_existing_products(supabase) -> dict:
+def get_existing_products(supabase) -> Dict:
+    """Fetch all existing products with their metadata"""
     existing = {}
     try:
-        result = supabase.table('products').select('id, product_url, title, image_url, price, created_at').eq('source', SOURCE).execute()
+        result = supabase.table('products').select(
+            'id, product_url, title, image_url, price, created_at, updated_at'
+        ).eq('source', SOURCE).execute()
+        
         for p in result.data:
             existing[p['product_url']] = p
     except Exception as e:
@@ -248,8 +251,42 @@ def get_existing_products(supabase) -> dict:
     return existing
 
 
+def get_stale_candidates(supabase) -> Dict:
+    """Get products that haven't been updated recently (potential stale)"""
+    stale = {}
+    try:
+        # Get products not seen in last 2 days
+        cutoff = (datetime.utcnow() - timedelta(days=2)).isoformat()
+        result = supabase.table('products').select(
+            'id, product_url, updated_at, created_at'
+        ).eq('source', SOURCE).lt('updated_at', cutoff).execute()
+        
+        for p in result.data:
+            stale[p['product_url']] = p
+    except Exception as e:
+        print(f"Error fetching stale candidates: {e}")
+    return stale
+
+
+def check_changed(existing_product: dict, new_product: dict) -> bool:
+    """Check if product has actually changed"""
+    if not existing_product:
+        return True
+    
+    if existing_product.get('title') != new_product.get('title'):
+        return True
+    if existing_product.get('image_url') != new_product.get('image_url'):
+        return True
+    if existing_product.get('price') != new_product.get('price'):
+        return True
+    
+    return False
+
+
 def batch_upsert(supabase, products: list) -> dict:
-    results = {'success': 0, 'failed': 0}
+    """Insert/update products in batches of 50 with retry logic"""
+    results = {'success': 0, 'failed': 0, 'failed_ids': []}
+    timestamp = datetime.utcnow().isoformat()
     
     for i in range(0, len(products), BATCH_SIZE):
         batch = products[i:i + BATCH_SIZE]
@@ -277,6 +314,7 @@ def batch_upsert(supabase, products: list) -> dict:
                         'additional_images': p.get('additional_images'),
                         'price': p['price'],
                         'info_embedding': p.get('info_embedding'),
+                        'updated_at': timestamp,
                     }
                     data.append(record)
                 
@@ -287,8 +325,11 @@ def batch_upsert(supabase, products: list) -> dict:
             except Exception as e:
                 retry_count += 1
                 if retry_count >= MAX_RETRIES:
-                    print(f"Batch failed: {e}")
-                    results['failed'] += len(batch)
+                    print(f"Batch failed after {MAX_RETRIES} retries: {e}")
+                    for p in batch:
+                        results['failed'] += 1
+                        results['failed_ids'].append(p['id'])
+                        logging.error(f"Failed product: {p['id']} - {e}")
                 else:
                     time.sleep(1)
     
@@ -296,34 +337,33 @@ def batch_upsert(supabase, products: list) -> dict:
 
 
 def delete_stale_products(supabase, seen_urls: Set[str]) -> int:
+    """Delete products not seen in current run that have been stale for 2+ runs"""
     deleted = 0
+    
     try:
-        result = supabase.table('products').select('id, product_url').eq('source', SOURCE).execute()
+        # Get all products for this source
+        result = supabase.table('products').select(
+            'id, product_url, updated_at, created_at'
+        ).eq('source', SOURCE).execute()
+        
+        cutoff_date = (datetime.utcnow() - timedelta(days=2)).isoformat()
         
         for p in result.data:
+            # If not seen in current run AND not updated in 2+ days, delete
             if p['product_url'] not in seen_urls:
-                supabase.table('products').delete().eq('id', p['id']).execute()
-                deleted += 1
-                print(f"Deleted stale: {p['id']}")
+                updated_at = p.get('updated_at')
+                if updated_at and updated_at < cutoff_date:
+                    try:
+                        supabase.table('products').delete().eq('id', p['id']).execute()
+                        deleted += 1
+                        print(f"Deleted stale: {p['id']}")
+                    except Exception as e:
+                        print(f"Failed to delete {p['id']}: {e}")
         
     except Exception as e:
         print(f"Error deleting stale: {e}")
     
     return deleted
-
-
-def check_changed(existing_product: dict, new_product: dict) -> bool:
-    if not existing_product:
-        return True
-    
-    if existing_product.get('title') != new_product.get('title'):
-        return True
-    if existing_product.get('image_url') != new_product.get('image_url'):
-        return True
-    if existing_product.get('price') != new_product.get('price'):
-        return True
-    
-    return False
 
 
 def main():
@@ -360,9 +400,11 @@ def main():
     
     products_to_insert = []
     
-    print("\n=== Generating embeddings ===")
+    print("\n=== Processing products ===")
     for i, p in enumerate(all_products):
         existing_p = existing.get(p['product_url'])
+        
+        generate_embeddings = False
         
         if not existing_p:
             print(f"  {i+1}: NEW - {p['title'][:40]}")
@@ -375,10 +417,11 @@ def main():
         else:
             print(f"  {i+1}: UNCHANGED - {p['title'][:40]}")
             unchanged_count += 1
-            generate_embeddings = False
+            # Don't regenerate embeddings for unchanged products
             p['image_embedding'] = None
             p['info_embedding'] = None
         
+        # Only generate embeddings for new or changed products
         if generate_embeddings:
             if p.get('image_url'):
                 p['image_embedding'] = embedder.embed_image(p['image_url'])
@@ -390,14 +433,18 @@ def main():
         
         products_to_insert.append(p)
         
+        # Batch insert every 50 products
         if len(products_to_insert) >= BATCH_SIZE:
             print(f"\n  Inserting batch of {len(products_to_insert)}...")
-            result = batch_upsert(supabase, products_to_insert)
+            unique_products = {p['id']: p for p in products_to_insert}.values()
+            result = batch_upsert(supabase, list(unique_products))
             products_to_insert = []
     
+    # Insert remaining products
     if products_to_insert:
         print(f"\n  Inserting final batch of {len(products_to_insert)}...")
-        result = batch_upsert(supabase, products_to_insert)
+        unique_products = {p['id']: p for p in products_to_insert}.values()
+        result = batch_upsert(supabase, list(unique_products))
     
     print("\n=== Deleting stale products ===")
     stale_deleted = delete_stale_products(supabase, seen_urls)
@@ -405,10 +452,10 @@ def main():
     print("\n" + "="*50)
     print("RUN SUMMARY")
     print("="*50)
-    print(f"New products added:   {new_count}")
-    print(f"Products updated:     {updated_count}")
-    print(f"Unchanged:           {unchanged_count}")
-    print(f"Stale deleted:       {stale_deleted}")
+    print(f"New products added:     {new_count}")
+    print(f"Products updated:       {updated_count}")
+    print(f"Products unchanged:     {unchanged_count}")
+    print(f"Stale products deleted: {stale_deleted}")
     print("="*50)
 
 
