@@ -1,19 +1,16 @@
-name: Scrape Suspicious Antwerp
+name: Scrape
 
 on:
-  workflow_dispatch:
-    inputs:
-      test_mode:
-        description: 'Run in test mode (limited products)'
-        required: false
-        default: ''
-        type: string
   schedule:
-    - cron: '0 1 * * 3,0'
+    - cron: '0 1 * * 3'  # Wednesday 1AM UTC
+    - cron: '0 1 * * 0'  # Sunday 1AM UTC
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 720
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -23,78 +20,29 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U sentencepiece protobuf
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
       - name: Run scraper
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL || 'https://yqawmzggcgpeyaaynrjk.supabase.co' }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlxYXdtemdnY2dwZXlhYXlucmprIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTAxMDkyNiwiZXhwIjoyMDcwNTg2OTI2fQ.XtLpxausFriraFJeX27ZzsdQsFv3uQKXBBggoz6P4D4' }}
+        run: python scraper_fast.py
+
+      - name: Report status
+        if: always()
         run: |
-          if [ "${{ github.event.inputs.test_mode }}" == "true" ]; then
-            python3 -c "
-from scraper import SuspiciousAntwerpScraper
-scraper = SuspiciousAntwerpScraper()
-scraper.run(test_mode=True, max_products=10)
-"
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Scraper completed successfully"
           else
-            python3 -c "
-from scraper import SuspiciousAntwerpScraper
-scraper = SuspiciousAntwerpScraper()
-scraper.connect_supabase()
-
-# Get all product URLs
-all_urls = scraper.get_all_product_links()
-
-# Get existing URLs from DB
-result = scraper.supabase.table('products').select('product_url').eq('source', 'scraper-suspiciousantwerp').execute()
-existing_urls = set(p.get('product_url') for p in result.data if p.get('product_url'))
-
-# Filter to new URLs
-new_urls = [url for url in all_urls if url not in existing_urls]
-print(f'Need to import: {len(new_urls)} / {len(all_urls)}')
-
-if new_urls:
-    batch_size = 30
-    imported = 0
-    import time
-    
-    for i in range(0, len(new_urls), batch_size):
-        batch = new_urls[i:i+batch_size]
-        products_data = []
-        for url in batch:
-            soup = scraper.get_page(url)
-            if soup:
-                data = scraper.extract_product_data(soup, url)
-                products_data.append(data)
-            time.sleep(0.2)
-        
-        for j, product in enumerate(products_data):
-            product = scraper.generate_embeddings(product)
-            time.sleep(0.2)
-            if j > 0 and j % 10 == 0:
-                time.sleep(2)
-        
-        imp = scraper.import_to_supabase(products_data)
-        imported += imp
-        print(f'Batch {i//batch_size + 1}: {imp} imported')
-        time.sleep(2)
-    
-            print(f'Total imported: {imported}')
-"
-          fi
-
-      - name: Verify imports
-        if: github.event.inputs.test_mode != 'true'
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          python3 -c "
-from supabase import create_client
-import os
-supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
-result = supabase.table('products').select('id', count='exact').eq('source', 'scraper-suspiciousantwerp').execute()
-print(f'Total Suspicious Antwerp products: {result.count}')
-"
+            echo "❌ Scraper failed. Check logs for details."
+            exit 1
