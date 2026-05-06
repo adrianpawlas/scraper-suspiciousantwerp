@@ -178,6 +178,12 @@ def extract(url: str) -> Optional[dict]:
                 image_urls.append(src)
     
     main_image = image_urls[0] if image_urls else None
+    
+    # Skip products without image
+    if not main_image:
+        print(f"  Skipping product without image: {url}")
+        return None
+    
     additional_images = ", ".join(image_urls[1:7]) if len(image_urls) > 1 else ""
     
     size_patterns = soup.find_all(["span", "div", "button"])
